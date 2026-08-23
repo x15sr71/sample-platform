@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from importlib import reload
 from unittest import mock
@@ -97,9 +98,7 @@ class TestControllers(BaseTestCase):
         test: Test = Test.query.get(TEST_RUN_ID)
         comment_info = get_info_for_pr_comment(test)
         # we got a valid variant, so should still pass
-        self.assertEqual(comment_info.common_failed_tests, [])
-        self.assertEqual(comment_info.extra_failed_tests, [])
-        self.assertEqual(comment_info.fixed_tests, [])
+        self.assertEqual(comment_info.failed_tests, [])
         for stats in comment_info.category_stats:
             # make sure the stats for the category confirm that everything passed too
             self.assertEqual(stats.success, stats.total)
@@ -290,6 +289,83 @@ class TestControllers(BaseTestCase):
         mock_g.db.commit.assert_called_once()
         mock_create_instance.assert_called_once()
 
+    @mock.patch('mod_ci.controllers.wait_for_operation')
+    @mock.patch('mod_ci.controllers.create_instance')
+    @mock.patch('mod_ci.controllers.save_xml_to_file')
+    @mock.patch('builtins.open', new_callable=mock.mock_open())
+    @mock.patch('mod_ci.controllers.g')
+    @mock.patch('mod_ci.controllers.TestProgress')
+    @mock.patch('mod_ci.controllers.GcpInstance')
+    def test_start_test_compares_against_approved_baseline(self, mock_gcp_instance, mock_test_progress,
+                                                           mock_g, mock_open_file, mock_save_xml,
+                                                           mock_create_instance, mock_wait_for_operation):
+        """The file a test is compared against must be the approved baseline (issue #1173).
+
+        It used to be the previous run's own output whenever that run had recorded a
+        mismatch, which let a behavioural change promote itself to the reference.
+        Fixture ``TestResultFile(2, 2, 2, "sample_out2", "out2")`` is exactly that case:
+        a recorded ``got`` of ``out2`` for the output whose approved baseline is
+        ``sample_out2``.
+        """
+        import zipfile
+
+        import requests
+        from github.Artifact import Artifact
+
+        from mod_ci.controllers import Artifact_names, start_test
+
+        mock_gcp_instance.query.filter.return_value.first.return_value = None
+        mock_test_progress.query.filter.return_value.first.return_value = None
+
+        test = Test.query.first()
+        repository = MagicMock()
+
+        artifact = MagicMock(Artifact)
+        artifact.name = Artifact_names.linux if test.platform == TestPlatform.linux else Artifact_names.windows
+        artifact.workflow_run.head_sha = test.commit
+
+        class mock_zip:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extractall(*args, **kwargs):
+                return None
+
+        repository.get_artifacts.return_value = [artifact]
+        response = requests.models.Response()
+        response.status_code = 200
+        requests.get = MagicMock(return_value=response)
+        zipfile.ZipFile = MagicMock(return_value=mock_zip())
+
+        create_mock_db_query(mock_g)
+        mock_create_instance.return_value = {'name': 'op-1', 'status': 'RUNNING'}
+        mock_wait_for_operation.return_value = {'status': 'DONE'}
+
+        start_test(mock.ANY, self.app, mock_g.db, repository, test, mock.ANY)
+
+        self.assertTrue(mock_save_xml.called, "start_test wrote no test definition XML")
+
+        correct_texts = []
+        for call in mock_save_xml.call_args_list:
+            for correct in call.args[0].iter('correct'):
+                correct_texts.append(correct.text)
+
+        self.assertTrue(correct_texts, "no <correct> elements were emitted")
+
+        # The approved baselines, and nothing derived from a previous run's output.
+        expected = {rto.filename_correct for rto in RegressionTestOutput.query.all()}
+        for text in correct_texts:
+            self.assertIn(text, expected,
+                          f"compared against {text!r}, which is not an approved baseline")
+
+        stored_got = 'out2' + RegressionTestOutput.query.filter(
+            RegressionTestOutput.id == 2).first().correct_extension
+        self.assertNotIn(stored_got, correct_texts,
+                         "a previous run's recorded output was used as the comparison target")
+
     @mock.patch('github.Github.get_repo')
     @mock.patch('mod_ci.controllers.start_test')
     @mock.patch('mod_ci.controllers.get_compute_service_object')
@@ -408,12 +484,19 @@ class TestControllers(BaseTestCase):
 
         # Comment on test that fails some/all regression tests
         test = Test.query.get(2)
-        comment_pr(test)
+        status = comment_pr(test)
         pull_request.get_issue_comments.assert_called_with()
         args, kwargs = pull_request.create_issue_comment.call_args
         message = kwargs['body']
-        if "passed" not in message:
-            assert False, "Message not Correct"
+
+        # Test 2's fixtures record a mismatch for one regression test, so the
+        # comment has to report that verdict. The previous assertion only looked
+        # for the word "passed", which the failure copy also contained -- it
+        # would have held whatever the comment said.
+        self.assertIn('matched the approved output', message)
+        self.assertIn('do not match the approved output', message)
+        self.assertNotIn('All tests passed', message)
+        self.assertEqual(status, Status.FAILURE)
 
     @mock.patch('mod_test.controllers.get_test_results')
     @mock.patch('github.Github')
@@ -439,6 +522,92 @@ class TestControllers(BaseTestCase):
         message = kwargs['body']
         if regression_test.command not in message:
             assert False, "Message not Correct"
+
+    @mock.patch('mod_ci.controllers.get_info_for_pr_comment')
+    @mock.patch('mod_ci.controllers.Github')
+    def test_comment_pr_gives_the_report_a_repository_to_walk(self, mock_github, mock_info):
+        """The ancestor comparison needs GitHub, so the handle must reach the report.
+
+        Building the report before opening the client silently drops that
+        comparison in production while every test still passes, because the
+        fixtures have no ancestor run either way.
+        """
+        from mod_ci.controllers import comment_pr
+        from mod_test.models import Test
+
+        mock_info.return_value = MagicMock(failed_tests=[])
+        comment_pr(Test.query.get(2))
+
+        self.assertTrue(mock_info.called)
+        args, kwargs = mock_info.call_args
+        repository = kwargs.get('repository', args[1] if len(args) > 1 else None)
+        self.assertIsNotNone(repository, "the report was built without a repository")
+
+    def test_find_ancestor_run_prefers_the_nearest_ancestor_with_records(self):
+        """The comparison point is where the branch was cut from, not the tip of master.
+
+        Master moves while a branch is open. Comparing against its tip charges
+        the branch for everything that landed meanwhile, which is what made a
+        three-line PR look like it broke 45 tests.
+        """
+        from mod_ci.controllers import find_ancestor_run
+        from mod_test.models import (Test, TestPlatform, TestProgress,
+                                     TestStatus, TestType)
+
+        near = Test(TestPlatform.linux, TestType.commit, 1, 'master', 'sha_near')
+        far = Test(TestPlatform.linux, TestType.commit, 1, 'master', 'sha_far')
+        g.db.add_all([near, far])
+        g.db.commit()
+        g.db.add_all([TestProgress(near.id, TestStatus.completed, 'done'),
+                      TestProgress(far.id, TestStatus.completed, 'done')])
+        g.db.commit()
+
+        repository = MagicMock()
+        repository.get_pull.return_value.base.sha = 'sha_tip'
+        repository.get_commits.return_value = [MagicMock(sha=sha) for sha in
+                                               ('sha_tip', 'sha_near', 'sha_far')]
+
+        subject = Test.query.get(1)
+        self.assertEqual(find_ancestor_run(repository, subject).id, near.id)
+
+    def test_find_ancestor_run_ignores_runs_that_never_completed(self):
+        """A run that never finished has nothing to compare against."""
+        from mod_ci.controllers import find_ancestor_run
+        from mod_test.models import (Test, TestPlatform, TestProgress,
+                                     TestStatus, TestType)
+
+        unfinished = Test(TestPlatform.linux, TestType.commit, 1, 'master', 'sha_unfinished')
+        completed = Test(TestPlatform.linux, TestType.commit, 1, 'master', 'sha_completed')
+        g.db.add_all([unfinished, completed])
+        g.db.commit()
+        g.db.add_all([TestProgress(unfinished.id, TestStatus.testing, 'still going'),
+                      TestProgress(completed.id, TestStatus.completed, 'done')])
+        g.db.commit()
+
+        repository = MagicMock()
+        repository.get_pull.return_value.base.sha = 'sha_tip'
+        repository.get_commits.return_value = [MagicMock(sha=sha) for sha in
+                                               ('sha_unfinished', 'sha_completed')]
+
+        subject = Test.query.get(1)
+        self.assertEqual(find_ancestor_run(repository, subject).id, completed.id)
+
+    def test_find_ancestor_run_survives_github_being_unavailable(self):
+        """A missing comparison must not cost the whole comment."""
+        from mod_ci.controllers import find_ancestor_run
+        from mod_test.models import Test
+
+        repository = MagicMock()
+        repository.get_pull.side_effect = Exception('GitHub is having a moment')
+
+        self.assertIsNone(find_ancestor_run(repository, Test.query.get(1)))
+
+    def test_find_ancestor_run_without_a_repository_is_none(self):
+        """Callers that have no GitHub handle get no ancestor, not a crash."""
+        from mod_ci.controllers import find_ancestor_run
+        from mod_test.models import Test
+
+        self.assertIsNone(find_ancestor_run(None, Test.query.get(1)))
 
     def test_get_running_instances(self):
         """Test get_running_instances function."""
@@ -1797,6 +1966,110 @@ class TestControllers(BaseTestCase):
         mock_request.assert_not_called()
         mock_finish_type.assert_called_once_with(mock.ANY, 1, mock.ANY, mock.ANY)
 
+    @mock.patch('mod_ci.controllers.request')
+    @mock.patch('mod_ci.controllers.Test')
+    @mock.patch('mod_ci.controllers.upload_artifact_type_request')
+    def test_progress_reporter_artifactupload_type(self, mock_artifact_type, mock_test, mock_request):
+        """Test progress_reporter dispatches the artifactupload type to the handler."""
+        from mod_ci.controllers import progress_reporter
+
+        mock_test_obj = MagicMock()
+        mock_test_obj.token = "token"
+        mock_test.query.filter.return_value.first.return_value = mock_test_obj
+        mock_request.form = {'type': 'artifactupload'}
+        mock_artifact_type.return_value = True
+
+        self.assertEqual("OK", progress_reporter(1, "token"))
+        mock_artifact_type.assert_called_once_with(mock.ANY, 1, mock.ANY, mock.ANY, mock.ANY)
+
+    @mock.patch('mod_ci.controllers.request')
+    @mock.patch('mod_ci.controllers.Test')
+    @mock.patch('mod_ci.controllers.upload_artifact_type_request')
+    def test_progress_reporter_artifactupload_type_empty(self, mock_artifact_type, mock_test, mock_request):
+        """Test progress_reporter returns EMPTY when the artifact upload fails."""
+        from mod_ci.controllers import progress_reporter
+
+        mock_test_obj = MagicMock()
+        mock_test_obj.token = "token"
+        mock_test.query.filter.return_value.first.return_value = mock_test_obj
+        mock_request.form = {'type': 'artifactupload'}
+        mock_artifact_type.return_value = False
+
+        self.assertEqual("EMPTY", progress_reporter(1, "token"))
+        mock_artifact_type.assert_called_once_with(mock.ANY, 1, mock.ANY, mock.ANY, mock.ANY)
+
+    def test_upload_artifact_type_request_bad_type(self):
+        """Reject artifact uploads whose artifact_type is not whitelisted."""
+        from mod_ci.controllers import upload_artifact_type_request
+
+        mock_log = MagicMock()
+        mock_request = MagicMock()
+        mock_request.form = {'artifact_type': 'not_a_real_type'}
+
+        self.assertFalse(
+            upload_artifact_type_request(mock_log, 1, MagicMock(), MagicMock(), mock_request))
+        mock_log.warning.assert_called_once()
+
+    def test_upload_artifact_type_request_no_file(self):
+        """Reject artifact uploads with no file part."""
+        from mod_ci.controllers import upload_artifact_type_request
+
+        mock_log = MagicMock()
+        mock_request = MagicMock()
+        mock_request.form = {'artifact_type': 'binary'}
+        mock_request.files = {}
+
+        self.assertFalse(
+            upload_artifact_type_request(mock_log, 1, MagicMock(), MagicMock(), mock_request))
+
+    @mock.patch('mod_ci.controllers.secure_filename')
+    def test_upload_artifact_type_request_empty_filename(self, mock_filename):
+        """Reject artifact uploads with an empty filename."""
+        from mod_ci.controllers import upload_artifact_type_request
+
+        mock_log = MagicMock()
+        mock_request = MagicMock()
+        mock_request.form = {'artifact_type': 'combined_stdout'}
+        mock_request.files = {'file': MagicMock()}
+        mock_filename.return_value = ''
+
+        self.assertFalse(
+            upload_artifact_type_request(mock_log, 1, MagicMock(), MagicMock(), mock_request))
+
+    @mock.patch('mod_ci.controllers.os')
+    @mock.patch('mod_ci.controllers.secure_filename')
+    def test_upload_artifact_type_request(self, mock_filename, mock_os):
+        """Store a valid artifact under test_artifacts/<id>/ with the API's expected name."""
+        from mod_ci.controllers import upload_artifact_type_request
+        from mod_test.models import TestPlatform
+
+        mock_log = MagicMock()
+        mock_request = MagicMock()
+        mock_uploadfile = MagicMock()
+        mock_request.form = {'artifact_type': 'binary'}
+        mock_request.files = {'file': mock_uploadfile}
+        mock_filename.return_value = 'ccextractor'
+        mock_test = MagicMock()
+        mock_test.id = 7
+        mock_test.platform = TestPlatform.linux
+
+        self.assertTrue(
+            upload_artifact_type_request(mock_log, 7, '/repo', mock_test, mock_request))
+        mock_uploadfile.save.assert_called_once()
+        mock_os.replace.assert_called_once()
+        self.assertTrue(mock_os.makedirs.called)
+
+    def test_artifact_target_name_mapping(self):
+        """Artifact filenames are derived server-side per type and platform."""
+        from mod_ci.controllers import _artifact_target_name
+        from mod_test.models import TestPlatform
+
+        self.assertEqual('ccextractor', _artifact_target_name('binary', TestPlatform.linux))
+        self.assertEqual('ccextractorwinfull.exe', _artifact_target_name('binary', TestPlatform.windows))
+        self.assertEqual('coredump', _artifact_target_name('coredump', TestPlatform.linux))
+        self.assertEqual('combined_stdout.log', _artifact_target_name('combined_stdout', TestPlatform.windows))
+        self.assertIsNone(_artifact_target_name('bogus', TestPlatform.linux))
+
     @mock.patch('mod_ci.controllers.RegressionTestOutput')
     def test_equality_type_request_rto_none(self, mock_rto):
         """Test function equality_type_request when rto is None."""
@@ -1923,9 +2196,10 @@ class TestControllers(BaseTestCase):
     @mock.patch('mod_ci.controllers.g')
     @mock.patch('mod_ci.controllers.iter')
     @mock.patch('mod_ci.controllers.open')
+    @mock.patch('mod_ci.controllers.tempfile')
     @mock.patch('mod_ci.controllers.os')
     @mock.patch('mod_ci.controllers.secure_filename')
-    def test_upload_type_request(self, mock_filename, mock_os, mock_open, mock_iter,
+    def test_upload_type_request(self, mock_filename, mock_os, mock_tempfile, mock_open, mock_iter,
                                  mock_g, mock_rto, mock_result_file, mock_hashlib):
         """Test function upload_type_request."""
         from mod_ci.controllers import upload_type_request
@@ -1942,25 +2216,90 @@ class TestControllers(BaseTestCase):
         }
         mock_iter.return_value = ['chunk']
         mock_os.path.splitext.return_value = "a", "b"
+        mock_tempfile.mkstemp.return_value = (5, '/tmp/TempFiles/unique-b')
 
         upload_type_request(mock_log, 1, MagicMock(), MagicMock(), mock_request)
 
         mock_log.debug.assert_called_once()
         mock_filename.assert_called_once()
-        # 4 calls: temp_dir, temp_path, results_dir, final_path
-        self.assertEqual(4, mock_os.path.join.call_count)
+        # 3 calls: temp_dir, results_dir, final_path. The temp path now comes from mkstemp.
+        self.assertEqual(3, mock_os.path.join.call_count)
         # 2 calls: makedirs for TempFiles and TestResults directories
         self.assertEqual(2, mock_os.makedirs.call_count)
+        mock_tempfile.mkstemp.assert_called_once_with(dir=mock.ANY, suffix="b")
+        mock_os.close.assert_called_once_with(5)
         mock_upload_file.save.assert_called_once()
         mock_open.assert_called_once_with(mock.ANY, "rb")
         mock_os.path.splitext.assert_called_once_with(mock.ANY)
-        mock_os.rename.assert_called_once_with(mock.ANY, mock.ANY)
+        mock_os.replace.assert_called_once_with(mock.ANY, mock.ANY)
         mock_rto.query.filter.assert_called_once_with(mock_rto.id == 1)
         mock_result_file.assert_called_once_with(mock.ANY, 1, mock.ANY, mock.ANY, mock.ANY)
         mock_g.db.add.assert_called_once_with(mock.ANY)
         mock_g.db.commit.assert_called_once_with()
         mock_hashlib.sha256.assert_called_once_with()
         mock_iter.assert_called_once_with(mock.ANY, b"")
+
+    @mock.patch('mod_ci.controllers.TestResultFile')
+    @mock.patch('mod_ci.controllers.RegressionTestOutput')
+    @mock.patch('mod_ci.controllers.g')
+    def test_upload_type_request_uses_unique_temp_path(self, mock_g, mock_rto, mock_result_file):
+        """Two tests uploading the same filename must not share a temp path.
+
+        The uploaded name is derived from the regression test output, so it is identical
+        across concurrent tests. A shared temp path let one upload clobber another's file,
+        which surfaced as HTTP 500s and missing results.
+        """
+        import tempfile as real_tempfile
+
+        from mod_ci.controllers import upload_type_request
+
+        saved_paths = []
+
+        def make_request(content):
+            uploaded = MagicMock()
+            uploaded.filename = 'shared_name.srt'
+            uploaded.save = lambda path: (saved_paths.append(path),
+                                          open(path, 'wb').write(content))
+            request = MagicMock()
+            request.files = {'file': uploaded}
+            request.form = {'test_id': 1, 'test_file_id': 1}
+            return request
+
+        with real_tempfile.TemporaryDirectory() as repo_folder:
+            self.assertTrue(upload_type_request(MagicMock(), 1, repo_folder, MagicMock(),
+                                                make_request(b'output of test one')))
+            self.assertTrue(upload_type_request(MagicMock(), 2, repo_folder, MagicMock(),
+                                                make_request(b'output of test two')))
+
+            self.assertEqual(2, len(saved_paths))
+            self.assertNotEqual(saved_paths[0], saved_paths[1],
+                                "both uploads reused one temp path; concurrent tests will race")
+
+            results = os.listdir(os.path.join(repo_folder, 'TestResults'))
+            self.assertEqual(2, len(results), "each upload should land as its own result file")
+            for name in results:
+                self.assertTrue(name.endswith('.srt'))
+            # Nothing may be left behind in TempFiles.
+            self.assertEqual([], os.listdir(os.path.join(repo_folder, 'TempFiles')))
+
+    @mock.patch('mod_ci.controllers.g')
+    def test_upload_type_request_cleans_temp_file_on_failure(self, mock_g):
+        """A failed upload must not leak its temp file."""
+        import tempfile as real_tempfile
+
+        from mod_ci.controllers import upload_type_request
+
+        uploaded = MagicMock()
+        uploaded.filename = 'broken.srt'
+        uploaded.save = MagicMock(side_effect=OSError("disk went away"))
+        request = MagicMock()
+        request.files = {'file': uploaded}
+        request.form = {'test_id': 1, 'test_file_id': 1}
+
+        with real_tempfile.TemporaryDirectory() as repo_folder:
+            with self.assertRaises(OSError):
+                upload_type_request(MagicMock(), 1, repo_folder, MagicMock(), request)
+            self.assertEqual([], os.listdir(os.path.join(repo_folder, 'TempFiles')))
 
     @mock.patch('mod_ci.controllers.RegressionTest')
     @mock.patch('mod_ci.controllers.TestResult')
@@ -3189,6 +3528,45 @@ class TestParseGcpError(unittest.TestCase):
         self.assertIn("retried automatically", error_msg)
         # Should NOT contain raw technical details
         self.assertNotIn("us-central1-a", error_msg)
+
+    def test_parse_gcp_error_zone_resource_exhausted_with_details(self):
+        """Test that the _WITH_DETAILS variant gets the same user-friendly message."""
+        from mod_ci.controllers import parse_gcp_error
+
+        mock_log = MagicMock()
+        result = {
+            'status': 'DONE',
+            'error': {
+                'errors': [{
+                    'code': 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+                    'message': "The zone 'projects/test/zones/us-central1-a' does not have enough "
+                               "resources available to fulfill the request. '(resource type:compute)'."
+                }]
+            }
+        }
+
+        error_msg = parse_gcp_error(result, log=mock_log)
+        self.assertIn("GCP resources temporarily unavailable", error_msg)
+        self.assertIn("retried automatically", error_msg)
+        # Must not fall through to the generic "contact the administrator" message
+        self.assertNotIn("contact the administrator", error_msg)
+        self.assertNotIn("us-central1-a", error_msg)
+
+    def test_zone_resource_exhausted_variants_are_retryable(self):
+        """Both zone-exhaustion codes must be retryable so the test stays pending."""
+        from mod_ci.controllers import is_retryable_gcp_error
+
+        for code in ('ZONE_RESOURCE_POOL_EXHAUSTED', 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS'):
+            with self.subTest(code=code):
+                result = {'error': {'errors': [{'code': code, 'message': 'no capacity'}]}}
+                self.assertTrue(is_retryable_gcp_error(result))
+
+    def test_non_transient_gcp_error_is_not_retryable(self):
+        """A genuine failure must still be marked failed rather than retried forever."""
+        from mod_ci.controllers import is_retryable_gcp_error
+
+        result = {'error': {'errors': [{'code': 'RESOURCE_NOT_FOUND', 'message': 'nope'}]}}
+        self.assertFalse(is_retryable_gcp_error(result))
 
     def test_parse_gcp_error_quota_exceeded(self):
         """Test that QUOTA_EXCEEDED returns user-friendly message."""

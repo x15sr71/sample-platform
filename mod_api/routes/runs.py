@@ -8,6 +8,7 @@ GET    /runs/{id}/summary      Pass/fail/skip counts
 GET    /runs/{id}/progress     Progress event timeline
 GET    /runs/{id}/config       Run configuration and test matrix
 POST   /runs/{id}/cancel       Cancel a queued or running test
+POST   /runs/{id}/restart      Clear a run's results so CI picks it up again
 """
 
 from collections import defaultdict
@@ -32,6 +33,7 @@ from mod_api.services.status import (batch_get_run_data, derive_run_status,
 from mod_api.utils import get_sort_column, paginated_response, single_response
 from mod_auth.models import Role
 from mod_customized.models import CustomizedTest
+from mod_home.models import CCExtractorVersion
 from mod_regression.models import RegressionTest, RegressionTestOutput
 from mod_test.models import (Fork, Test, TestPlatform, TestProgress,
                              TestResult, TestResultFile, TestStatus, TestType)
@@ -123,6 +125,20 @@ def _apply_run_filters(query, created_after, created_before):
     commit_sha = request.args.get('commit_sha')
     if commit_sha:
         query = query.filter(Test.commit == commit_sha)
+
+    # A release is recorded as the commit it was cut from, so filtering by
+    # version is the commit filter with one lookup in front of it.
+    ccx_version = request.args.get('ccx_version')
+    if ccx_version:
+        version = CCExtractorVersion.query.filter(
+            CCExtractorVersion.version == ccx_version).first()
+        if version is None:
+            return None, make_error_response(
+                'validation_error',
+                f'Unknown CCExtractor version: {ccx_version}.',
+                http_status=400,
+            )
+        query = query.filter(Test.commit == version.commit)
 
     repository = request.args.get('repository')
     if repository:
@@ -674,4 +690,47 @@ def cancel_run(run_id):
         'action': 'cancel',
         'status': 'accepted',
         'message': 'Run has been canceled.',
+    }, http_status=202)
+
+
+@mod_api.route('/runs/<run_id>/restart', methods=['POST'])
+@require_roles([Role.admin, Role.contributor, Role.tester])
+@require_scope(Scope.RUNS_WRITE)
+@validate_path_id('run_id')
+def restart_run(run_id):
+    """
+    Queue a finished or stuck run to be executed again.
+
+    Clearing the results and the progress trail is what makes the run
+    eligible again, because CI picks up tests that have no progress
+    recorded. The run keeps its id, so existing links stay valid, and the
+    old results are replaced rather than kept alongside the new ones.
+
+    Like cancel, this is open to anyone holding runs:write rather than to
+    the run's owner, which suits a shared CI where a stuck VM blocks
+    everybody.
+    """
+    # Locked the way cancel locks, so two restarts arriving together do not
+    # both go clearing the same results.
+    test = Test.query.with_for_update().filter(Test.id == run_id).first()
+    if test is None:
+        return make_error_response(
+            'not_found',
+            f'Run {run_id} not found.',
+            http_status=404)
+
+    TestResultFile.query.filter(
+        TestResultFile.test_id == test.id).delete(synchronize_session=False)
+    TestResult.query.filter(
+        TestResult.test_id == test.id).delete(synchronize_session=False)
+    TestProgress.query.filter(
+        TestProgress.test_id == test.id).delete(synchronize_session=False)
+    g.db.commit()
+
+    g.log.info(f'run {run_id} restarted via API by {g.api_user.id}')
+    return single_response({
+        'run_id': run_id,
+        'action': 'restart',
+        'status': 'accepted',
+        'message': 'Run has been queued to run again.',
     }, http_status=202)

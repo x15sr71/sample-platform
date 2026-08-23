@@ -1,37 +1,58 @@
 """
 Sample and regression test routes.
 
-GET /runs/{id}/samples              Per-run regression test results
-GET /runs/{id}/samples/{sid}        Single result in a run
-GET /samples                        Media sample catalog
-GET /samples/{id}                   Single media sample
-GET /samples/{id}/history           Cross-run history for a sample
-GET /regression-tests               Regression test definitions
+GET    /runs/{id}/samples           Per-run regression test results
+GET    /runs/{id}/samples/{sid}     Single result in a run
+GET    /samples                     Media sample catalog
+GET    /samples/{id}                Single media sample
+PATCH  /samples/{id}                Edit tags and upload metadata
+DELETE /samples/{id}                Delete a sample no test uses
+GET    /samples/{id}/details        Upload metadata, extra files, media info
+GET    /samples/{id}/download       Where the media file lives in storage
+GET    /samples/{id}/media-info/download
+                                    Where the MediaInfo XML lives
+GET    /samples/{id}/extra-files/{eid}/download
+                                    Where an accompanying file lives
+DELETE /samples/{id}/extra-files/{eid}
+                                    Delete an accompanying file
+GET    /samples/{id}/history        Cross-run history for a sample
+GET    /tags                        Tags a sample can be labelled with
+POST   /tags                        Create a tag
+GET    /regression-tests            Regression test definitions
 """
 
+import os
 from collections import defaultdict
 
 from flask import g, request
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, selectinload
 
 from mod_api import mod_api
-from mod_api.middleware.auth import require_scope
+from mod_api.middleware.auth import require_roles, require_scope
 from mod_api.middleware.error_handler import make_error_response
-from mod_api.middleware.validation import (validate_date_range,
+from mod_api.middleware.validation import (validate_body, validate_date_range,
                                            validate_offset_pagination,
                                            validate_path_id)
 from mod_api.models.api_token import Scope
-from mod_api.schemas.samples import SampleHistoryEntrySchema
+from mod_api.schemas.samples import (SampleHistoryEntrySchema,
+                                     SampleUpdateSchema, TagCreateSchema)
 from mod_api.services.status import (batch_get_run_data, derive_output_status,
                                      derive_sample_status, get_run_timestamps,
                                      is_dummy_row)
-from mod_api.utils import paginated_response, single_response
+from mod_api.services.storage import resolve_artifact
+from mod_api.utils import paginated_response, safe_resolve, single_response
+from mod_auth.models import Role
+from mod_home.models import CCExtractorVersion
 from mod_regression.models import (Category, RegressionTest,
                                    RegressionTestOutput)
-from mod_sample.models import Sample, Tag
+from mod_sample.media_info_parser import (InvalidMediaInfoError,
+                                          MediaInfoFetcher)
+from mod_sample.models import ExtraFile, Sample, Tag
 from mod_test.models import (Test, TestPlatform, TestProgress, TestResult,
                              TestResultFile)
+from mod_upload.models import Platform, Upload
 
 # Valid per-sample status values accepted by the ?status filter. Limited to the
 # statuses derive_sample_status can actually emit, so filtering can't silently
@@ -39,6 +60,15 @@ from mod_test.models import (Test, TestPlatform, TestProgress, TestResult,
 _VALID_SAMPLE_STATUSES = frozenset({
     'pass', 'fail', 'missing_output', 'not_started',
 })
+
+# How many result rows /samples/{id}/history will scan when ?status is set.
+# Status comes from derive_sample_status, which needs the result files and
+# expected outputs, so it can't be pushed into SQL the way branch/platform
+# can. Without a bound the endpoint has to load a sample's entire history to
+# filter it, which is what made it time out on production. Bounded scans are
+# reported with pagination.truncated so a caller can tell a capped page from
+# a complete one.
+_HISTORY_STATUS_SCAN_LIMIT = 1000
 
 
 def _preload_expected_outputs(results):
@@ -342,6 +372,67 @@ def list_samples(limit=50, offset=0):
     return paginated_response(serialized, total, limit, offset)
 
 
+@mod_api.route('/samples/<sample_id>/details', methods=['GET'])
+@require_scope(Scope.RUNS_READ)
+@validate_path_id('sample_id')
+def get_sample_details(sample_id):
+    """
+    Everything known about one sample, for a detail view.
+
+    Extends the /samples/{id} summary with the upload record, any extra
+    files, and the parsed MediaInfo tree. Media info is best-effort: missing
+    or unparseable XML reports ``null`` rather than failing the response.
+    Unlike the classic page this never regenerates the XML, because a GET
+    should not write to the sample repository.
+    """
+    sample = Sample.query.options(joinedload(Sample.tags)).filter(
+        Sample.id == sample_id).first()
+    if sample is None:
+        return make_error_response(
+            'not_found', f'Sample {sample_id} not found.', http_status=404)
+
+    upload = Upload.query.filter(Upload.sample_id == sample.id).first()
+    upload_info = None
+    if upload is not None:
+        version = upload.version
+        upload_info = {
+            'platform': upload.platform.value if upload.platform else None,
+            'parameters': upload.parameters or '',
+            'notes': upload.notes or '',
+            'version': version.version if version else None,
+            'version_released': (
+                version.released.isoformat()
+                if version and version.released else None),
+        }
+
+    extra_files = [
+        {
+            'id': extra.id,
+            'original_name': extra.original_name,
+            'extension': extra.extension,
+        }
+        for extra in ExtraFile.query.filter(
+            ExtraFile.sample_id == sample.id).all()
+    ]
+
+    try:
+        media_info = MediaInfoFetcher(sample).get_media_info()
+    except InvalidMediaInfoError:
+        media_info = None
+
+    return single_response({
+        'sample_id': sample.id,
+        'sha': sample.sha,
+        'extension': sample.extension,
+        'original_name': sample.original_name,
+        'filename': sample.filename,
+        'tags': [tag.name for tag in sample.tags],
+        'upload': upload_info,
+        'extra_files': extra_files,
+        'media_info': media_info,
+    })
+
+
 @mod_api.route('/samples/<sample_id>', methods=['GET'])
 @require_scope(Scope.RUNS_READ)
 @validate_path_id('sample_id')
@@ -369,6 +460,335 @@ def get_sample(sample_id):
         'regression_test_count': active_count,
         'active': active_count > 0,
     })
+
+
+@mod_api.route('/samples/<sample_id>/download', methods=['GET'])
+@require_scope(Scope.RUNS_READ)
+@validate_path_id('sample_id')
+def download_sample(sample_id):
+    """
+    Locate a sample's media file in storage.
+
+    Returns a signed URL rather than the bytes. Samples run to several
+    gigabytes, so streaming one through the API would hold a worker for the
+    length of the transfer. Where only the local copy exists there is no URL
+    to hand out and storage_status reports that instead, matching how
+    /runs/{id}/artifacts describes the same two backends.
+    """
+    sample = Sample.query.filter(Sample.id == sample_id).first()
+    if sample is None:
+        return make_error_response(
+            'not_found', f'Sample {sample_id} not found.', http_status=404)
+
+    url, status = resolve_artifact(f'TestFiles/{sample.filename}')
+    if status == 'missing':
+        return make_error_response(
+            'not_found',
+            f'Sample {sample_id} is not present in storage.',
+            http_status=404)
+
+    return single_response({
+        'sample_id': sample.id,
+        'filename': sample.filename,
+        'download_url': url,
+        'storage_status': status,
+    })
+
+
+@mod_api.route('/tags', methods=['GET'])
+@require_scope(Scope.RUNS_READ)
+@validate_offset_pagination()
+def list_tags(limit=50, offset=0):
+    """List the tags a sample can be labelled with, alphabetically."""
+    query = Tag.query.order_by(Tag.name.asc())
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+    return paginated_response(
+        [{'id': t.id, 'name': t.name, 'description': t.description or ''}
+         for t in rows], total, limit, offset)
+
+
+@mod_api.route('/tags', methods=['POST'])
+@require_roles([Role.admin])
+@require_scope(Scope.RUNS_WRITE)
+@validate_body(TagCreateSchema)
+def create_tag(validated_data=None):
+    """Create a tag. Names are unique, so a duplicate is a 409."""
+    name = validated_data['name']
+    if Tag.query.filter(Tag.name == name).first() is not None:
+        return make_error_response(
+            'conflict', f"Tag '{name}' already exists.", http_status=409)
+
+    tag = Tag(name, validated_data['description'])
+    g.db.add(tag)
+    try:
+        g.db.commit()
+    except IntegrityError:
+        # name is unique, so a request that raced the check lands here.
+        g.db.rollback()
+        return make_error_response(
+            'conflict', f"Tag '{name}' already exists.", http_status=409)
+
+    g.log.info(f'tag {tag.id} created via API by {g.api_user.id}')
+    return single_response(
+        {'id': tag.id, 'name': tag.name, 'description': tag.description or ''},
+        http_status=201)
+
+
+#: Sample edit fields that live on the upload row rather than the sample.
+_UPLOAD_FIELDS = frozenset(['notes', 'parameters', 'platform', 'version'])
+
+
+def _apply_tags(sample, names):
+    """
+    Replace a sample's tags, matching them by name.
+
+    Returns an error response when a name is not a tag, so one typo rejects
+    the whole request instead of silently dropping a label.
+    """
+    rows = Tag.query.filter(Tag.name.in_(names)).all()
+    found = {t.name for t in rows}
+    unknown = [n for n in names if n not in found]
+    if unknown:
+        return make_error_response(
+            'validation_error',
+            f"Unknown tags: {', '.join(unknown)}",
+            details={'fields': {'tags': unknown}},
+            http_status=400,
+        )
+    sample.tags = rows
+    return None
+
+
+def _apply_upload_fields(sample_id, data, requested):
+    """
+    Write the parts of a sample edit that belong to its upload row.
+
+    Returns an error response when there is no upload row to write to, or
+    when the version named is not one the platform knows.
+    """
+    upload = Upload.query.filter(Upload.sample_id == sample_id).first()
+    if upload is None:
+        return make_error_response(
+            'conflict',
+            f'Sample {sample_id} has no upload record, so '
+            f"{', '.join(sorted(requested))} cannot be set on it.",
+            http_status=409,
+        )
+
+    if 'notes' in data:
+        upload.notes = data['notes']
+    if 'parameters' in data:
+        upload.parameters = data['parameters']
+    if 'platform' in data:
+        upload.platform = Platform.from_string(data['platform'])
+    if 'version' in data:
+        version = CCExtractorVersion.query.filter(
+            CCExtractorVersion.version == data['version']).first()
+        if version is None:
+            return make_error_response(
+                'validation_error',
+                f"Unknown CCExtractor version: {data['version']}",
+                http_status=400)
+        upload.version_id = version.id
+    return None
+
+
+@mod_api.route('/samples/<sample_id>', methods=['PATCH'])
+@require_roles([Role.admin])
+@require_scope(Scope.RUNS_WRITE)
+@validate_path_id('sample_id')
+@validate_body(SampleUpdateSchema)
+def update_sample(sample_id, validated_data=None):
+    """
+    Edit a sample's tags and the upload metadata recorded with it.
+
+    Notes, parameters, platform and version live on the upload row rather
+    than the sample, so a sample that arrived without one (over FTP, or
+    seeded directly) can only have its tags changed.
+    """
+    sample = Sample.query.filter(Sample.id == sample_id).first()
+    if sample is None:
+        return make_error_response(
+            'not_found', f'Sample {sample_id} not found.', http_status=404)
+
+    data = validated_data
+    if not data:
+        return make_error_response(
+            'validation_error', 'No fields to update.', http_status=400)
+
+    if 'tags' in data:
+        err = _apply_tags(sample, data['tags'])
+        if err:
+            return err
+
+    requested = _UPLOAD_FIELDS & set(data)
+    if requested:
+        err = _apply_upload_fields(sample.id, data, requested)
+        if err:
+            return err
+
+    g.db.commit()
+
+    g.log.info(f'sample {sample.id} updated via API by {g.api_user.id}: '
+               f'{sorted(data.keys())}')
+    return single_response({
+        'sample_id': sample.id,
+        'tags': [t.name for t in sample.tags],
+    })
+
+
+def _remove_local(relative_path):
+    """
+    Delete a file under the sample repository, tolerating its absence.
+
+    In production the repository is a gcsfuse mount, so this removes the
+    stored object too. A path that no longer exists is not an error: the
+    row is going either way, and refusing would leave the database holding
+    a sample whose files are already gone.
+    """
+    from run import config
+
+    root = config.get('SAMPLE_REPOSITORY', '')
+    path = safe_resolve(root, relative_path)
+    if path is None:
+        g.log.warning(f'refusing to delete path outside the repository: '
+                      f'{relative_path}')
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        g.log.warning(f'could not delete {relative_path}: {e}')
+
+
+@mod_api.route('/samples/<sample_id>', methods=['DELETE'])
+@require_roles([Role.admin])
+@require_scope(Scope.RUNS_WRITE)
+@validate_path_id('sample_id')
+def delete_sample(sample_id):
+    """
+    Delete a sample, its extra files and its media info.
+
+    Refused while any regression test still points at it, because removing
+    the media would leave those tests unable to run and their history
+    describing a sample nobody can fetch. Detach or delete the tests first.
+    """
+    sample = Sample.query.options(joinedload(Sample.extra_files)).filter(
+        Sample.id == sample_id).first()
+    if sample is None:
+        return make_error_response(
+            'not_found', f'Sample {sample_id} not found.', http_status=404)
+
+    test_count = RegressionTest.query.filter_by(sample_id=sample.id).count()
+    if test_count:
+        return make_error_response(
+            'conflict',
+            f'Sample {sample_id} is used by {test_count} regression '
+            f'test(s). Delete those first.',
+            details={'regression_test_count': test_count},
+            http_status=409,
+        )
+
+    # Read the paths off the row before it goes, then unlink only once the
+    # delete is committed: the same order finalize uses, so a failed commit
+    # cannot leave a sample row pointing at media that is already gone.
+    paths = [f'TestFiles/extra/{extra.filename}' for extra in
+             sample.extra_files]
+    paths.append(f'TestFiles/media/{sample.sha}.xml')
+    paths.append(f'TestFiles/{sample.filename}')
+
+    g.db.delete(sample)
+    g.db.commit()
+
+    for path in paths:
+        _remove_local(path)
+
+    g.log.warning(f'sample {sample_id} deleted via API by {g.api_user.id}')
+    return single_response({'sample_id': int(sample_id), 'deleted': True})
+
+
+@mod_api.route(
+    '/samples/<sample_id>/extra-files/<int:extra_id>', methods=['DELETE'])
+@require_roles([Role.admin])
+@require_scope(Scope.RUNS_WRITE)
+@validate_path_id('sample_id')
+def delete_extra_file(sample_id, extra_id):
+    """Delete one of the files uploaded alongside a sample."""
+    extra, err = _get_extra_file(sample_id, extra_id)
+    if err:
+        return err
+
+    _remove_local(f'TestFiles/extra/{extra.filename}')
+    g.db.delete(extra)
+    g.db.commit()
+
+    g.log.warning(f'extra file {extra_id} of sample {sample_id} deleted via '
+                  f'API by {g.api_user.id}')
+    return single_response({'id': extra_id, 'deleted': True})
+
+
+def _located(sample_id, relative_path, filename, missing_message):
+    """Report where one of a sample's files is, in the download shape."""
+    url, status = resolve_artifact(relative_path)
+    if status == 'missing':
+        return make_error_response(
+            'not_found', missing_message, http_status=404)
+    return single_response({
+        'sample_id': sample_id,
+        'filename': filename,
+        'download_url': url,
+        'storage_status': status,
+    })
+
+
+@mod_api.route('/samples/<sample_id>/media-info/download', methods=['GET'])
+@require_scope(Scope.RUNS_READ)
+@validate_path_id('sample_id')
+def download_media_info(sample_id):
+    """
+    Locate the MediaInfo XML written alongside a sample.
+
+    The parsed tree is already on /samples/{id}/details; this is for anyone
+    who wants the original file MediaInfo produced.
+    """
+    sample = Sample.query.filter(Sample.id == sample_id).first()
+    if sample is None:
+        return make_error_response(
+            'not_found', f'Sample {sample_id} not found.', http_status=404)
+
+    name = f'{sample.sha}.xml'
+    return _located(
+        sample.id, f'TestFiles/media/{name}', name,
+        f'No media info stored for sample {sample_id}.')
+
+
+def _get_extra_file(sample_id, extra_id):
+    """Look up one extra file, matched against the sample that owns it."""
+    extra = ExtraFile.query.filter_by(
+        id=extra_id, sample_id=sample_id).first()
+    if extra is None:
+        return None, make_error_response(
+            'not_found',
+            f'Extra file {extra_id} not found on sample {sample_id}.',
+            http_status=404)
+    return extra, None
+
+
+@mod_api.route(
+    '/samples/<sample_id>/extra-files/<int:extra_id>/download',
+    methods=['GET']
+)
+@require_scope(Scope.RUNS_READ)
+@validate_path_id('sample_id')
+def download_extra_file(sample_id, extra_id):
+    """Locate one of the files uploaded alongside a sample."""
+    extra, err = _get_extra_file(sample_id, extra_id)
+    if err:
+        return err
+
+    return _located(
+        int(sample_id), f'TestFiles/extra/{extra.filename}', extra.filename,
+        f'Extra file {extra_id} is not present in storage.')
 
 
 def _get_history_failure_signature(result, result_files, status):
@@ -423,6 +843,86 @@ def _process_history_entries(
             'failure_signature': failure_sig,
         })
     return entries
+
+
+def _build_history_entries(results, status_filter):
+    """Build history entries for exactly ``results``, batching the lookups.
+
+    Every follow-up query here is keyed off the results handed in, so the
+    work scales with that list. Callers must therefore pass the page they
+    intend to return, not the sample's whole history.
+    """
+    if not results:
+        return []
+
+    test_ids = list({r.test_id for r in results})
+
+    all_files = TestResultFile.query.options(
+        joinedload(TestResultFile.regression_test_output)
+        .joinedload(RegressionTestOutput.multiple_files)
+    ).filter(TestResultFile.test_id.in_(test_ids)).all()
+    files_by_result = defaultdict(list)
+    for f in all_files:
+        files_by_result[(f.test_id, f.regression_test_id)].append(f)
+
+    # Preload expected outputs so status matches /summary and /samples.
+    expected_by_rt = _preload_expected_outputs(results)
+
+    # Batch load tests to avoid N+1 in _process_history_entries
+    unique_tests = Test.query.filter(Test.id.in_(test_ids)).all()
+    test_map = {t.id: t for t in unique_tests}
+
+    # Batch compute timestamps for all referenced tests
+    _, timestamps_map = batch_get_run_data(unique_tests)
+
+    return _process_history_entries(
+        results,
+        files_by_result,
+        status_filter,
+        timestamps_map=timestamps_map,
+        test_map=test_map,
+        expected_by_rt=expected_by_rt)
+
+
+def _resolve_history_rt_ids(rt_ids, sample_id):
+    """Narrow a sample's regression tests to the optional ?regression_test_id.
+
+    Without this, ``limit`` counts rows across every regression test on the
+    sample, so a caller asking about one test gets roughly
+    limit / len(rt_ids) runs of it and cannot tell the window was short.
+    """
+    raw = request.args.get('regression_test_id')
+    if raw is None:
+        return rt_ids, None
+
+    try:
+        rt_id = int(raw)
+        if rt_id < 1 or rt_id > 2147483647:
+            raise ValueError('Out of bounds')
+    except (ValueError, TypeError):
+        return None, make_error_response(
+            'validation_error',
+            'regression_test_id must be a positive integer '
+            'between 1 and 2147483647.',
+            details={
+                'fields': {
+                    'regression_test_id': 'Must be a positive integer '
+                    'between 1 and 2147483647.'}},
+            http_status=400,
+        )
+
+    if rt_id not in rt_ids:
+        return None, make_error_response(
+            'validation_error',
+            f'Regression test {rt_id} does not belong to sample {sample_id}.',
+            details={
+                'fields': {
+                    'regression_test_id': 'Must be a regression test of '
+                    'this sample.'}},
+            http_status=400,
+        )
+
+    return [rt_id], None
 
 
 def _apply_history_filters(
@@ -480,6 +980,15 @@ def get_sample_history(
     Show how a sample performed across different runs.
 
     Use failure_signature to tell apart genuine regressions from infra flakes.
+
+    Pass ?regression_test_id to follow a single regression test, so that
+    ``limit`` means that many runs of it rather than that many rows spread
+    across every regression test on the sample.
+
+    ?status is applied after status derivation, which needs result files, so
+    it can't be pushed into SQL. That path scans the most recent
+    _HISTORY_STATUS_SCAN_LIMIT results and sets pagination.truncated when a
+    sample has more history than that.
     """
     sample = Sample.query.options(joinedload(Sample.tags)).filter(
         Sample.id == sample_id).first()
@@ -495,6 +1004,10 @@ def get_sample_history(
 
     if not rt_ids:
         return paginated_response([], 0, limit, offset)
+
+    rt_ids, err = _resolve_history_rt_ids(rt_ids, sample_id)
+    if err:
+        return err
 
     # Validate the status filter up front, before any heavy query.
     status_filter = request.args.get('status')
@@ -517,47 +1030,40 @@ def get_sample_history(
     if err:
         return err
 
-    results = query.order_by(Test.id.desc()).all()
+    # regression_test_id breaks ties so a row can't shift between pages when
+    # several regression tests share a run.
+    query = query.order_by(Test.id.desc(), TestResult.regression_test_id.asc())
 
-    # Preload TestResultFiles
-    test_ids = list({r.test_id for r in results})
-    all_files = TestResultFile.query.options(
-        joinedload(TestResultFile.regression_test_output)
-        .joinedload(RegressionTestOutput.multiple_files)
-    ).filter(
-        TestResultFile.test_id.in_(test_ids)).all() if test_ids else []
-    files_by_result = defaultdict(list)
-    for f in all_files:
-        files_by_result[(f.test_id, f.regression_test_id)].append(f)
+    if status_filter:
+        # One row past the cap tells us whether the scan was complete.
+        scanned = query.limit(_HISTORY_STATUS_SCAN_LIMIT + 1).all()
+        truncated = len(scanned) > _HISTORY_STATUS_SCAN_LIMIT
+        entries = _build_history_entries(
+            scanned[:_HISTORY_STATUS_SCAN_LIMIT], status_filter)
+        return paginated_response(
+            entries[offset:offset + limit],
+            len(entries),
+            limit,
+            offset,
+            schema=SampleHistoryEntrySchema(),
+            truncated=truncated,
+            extra_meta={'scan_limit': _HISTORY_STATUS_SCAN_LIMIT}
+            if truncated else None,
+        )
 
-    # Preload expected outputs so status matches /summary and /samples.
-    expected_by_rt = _preload_expected_outputs(results)
-
-    # Batch load tests to avoid N+1 in _process_history_entries
-    unique_tests = Test.query.filter(
-        Test.id.in_(test_ids)).all() if test_ids else []
-    test_map = {t.id: t for t in unique_tests}
-
-    # Batch compute timestamps for all referenced tests
-    _, timestamps_map = batch_get_run_data(unique_tests)
-
-    entries = _process_history_entries(
-        results,
-        files_by_result,
-        status_filter,
-        timestamps_map=timestamps_map,
-        test_map=test_map,
-        expected_by_rt=expected_by_rt)
-
-    total = len(entries)
-    paged = entries[offset:offset + limit]
+    # No status filter: the page can be cut in SQL, so everything below it
+    # loads one page worth of rows instead of the sample's whole history.
+    total = query.count()
+    results = query.offset(offset).limit(limit).all()
+    entries = _build_history_entries(results, None)
 
     return paginated_response(
-        paged, total, limit, offset, schema=SampleHistoryEntrySchema()
+        entries, total, limit, offset, schema=SampleHistoryEntrySchema()
     )
 
 
-def _serialize_rt(rt):
+def serialize_rt(rt):
+    """Public shape of a regression test definition, without its outputs."""
     return {
         'regression_test_id': rt.id,
         'sample_id': rt.sample_id,
@@ -643,5 +1149,5 @@ def list_regression_tests(limit=50, offset=0):
     # Paginate at DB level
     total = query.count()
     tests = query.offset(offset).limit(limit).all()
-    serialized = [_serialize_rt(rt) for rt in tests]
+    serialized = [serialize_rt(rt) for rt in tests]
     return paginated_response(serialized, total, limit, offset)

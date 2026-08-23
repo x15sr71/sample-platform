@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import patch
 
 from flask import g
@@ -346,3 +347,422 @@ class TestRoutesAuth(ApiTestCase):
             headers={
                 'Authorization': f'Bearer {admin_token}'})
         self.assertEqual(res2.status_code, 204)
+
+    def test_get_current_user_returns_role_and_scopes(self):
+        token = self.get_token(
+            'auth_user@local.com', 'userpass123', 'me_tok',
+            scopes=['runs:read']).json['token']
+
+        res = self.client.get(
+            '/api/v1/auth/me',
+            headers={'Authorization': f'Bearer {token}'})
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json['user_id'], self.user_id)
+        self.assertEqual(res.json['email'], 'auth_user@local.com')
+        # The role comes from the account, never from what the client asked
+        # for; this is what the web console gates its UI on.
+        self.assertEqual(res.json['role'], 'contributor')
+        self.assertEqual(res.json['scopes'], ['runs:read'])
+
+    def test_get_current_user_reports_admin_role(self):
+        token = self.get_token(
+            'auth_admin@local.com', 'adminpass123', 'me_admin',
+            scopes=['runs:read']).json['token']
+
+        res = self.client.get(
+            '/api/v1/auth/me',
+            headers={'Authorization': f'Bearer {token}'})
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json['role'], 'admin')
+
+    def test_get_current_user_requires_a_token(self):
+        res = self.client.get('/api/v1/auth/me')
+        self.assertEqual(res.status_code, 401)
+
+    def _admin_token(self, name='usr_admin'):
+        return self.get_token('auth_admin@local.com', 'adminpass123', name,
+                              scopes=['tokens:manage']).json['token']
+
+    def _patch_user(self, token, user_id, body):
+        return self.client.patch(
+            f'/api/v1/users/{user_id}',
+            data=json.dumps(body),
+            content_type='application/json',
+            headers={'Authorization': f'Bearer {token}'})
+
+    def test_list_users(self):
+        res = self.client.get(
+            '/api/v1/users',
+            headers={'Authorization': f'Bearer {self._admin_token()}'})
+
+        self.assertEqual(res.status_code, 200)
+        row = next(r for r in res.json['data']
+                   if r['email'] == 'auth_admin@local.com')
+        self.assertEqual(row['role'], 'admin')
+        self.assertFalse(row['github_linked'])
+        # Credentials must never appear in the payload.
+        self.assertNotIn('password', row)
+        self.assertNotIn('github_token', row)
+
+    def test_list_users_is_paginated(self):
+        res = self.client.get(
+            '/api/v1/users?limit=1&offset=0',
+            headers={'Authorization': f'Bearer {self._admin_token("usr_p")}'})
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.json['data']), 1)
+        # total counts every user, not just the page, so a client knows to
+        # keep paging instead of silently seeing the first page only.
+        self.assertGreaterEqual(res.json['pagination']['total'], 2)
+
+    def test_list_users_forbidden_for_contributor(self):
+        token = self.get_token('auth_user@local.com', 'userpass123',
+                               'usr_c', scopes=['runs:read']).json['token']
+        res = self.client.get(
+            '/api/v1/users', headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(res.status_code, 403)
+
+    def test_update_user_role(self):
+        res = self._patch_user(self._admin_token('usr_up'), self.user_id,
+                               {'role': 'user'})
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json['role'], 'user')
+        self.assertEqual(
+            User.query.filter(User.id == self.user_id).first().role, Role.user)
+
+    def test_update_user_role_rejects_self(self):
+        admin_id = User.query.filter(
+            User.email == 'auth_admin@local.com').first().id
+        res = self._patch_user(self._admin_token('usr_self'), admin_id,
+                               {'role': 'user'})
+
+        # Demoting yourself would leave nobody able to undo it.
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(
+            User.query.filter(User.id == admin_id).first().role, Role.admin)
+
+    def test_update_user_role_invalid_role(self):
+        res = self._patch_user(self._admin_token('usr_bad'), self.user_id,
+                               {'role': 'superuser'})
+        self.assertEqual(res.status_code, 400)
+
+    def test_update_user_role_unknown_user(self):
+        res = self._patch_user(self._admin_token('usr_404'), 999999,
+                               {'role': 'user'})
+        self.assertEqual(res.status_code, 404)
+
+    # ---- account: signup, reset, self-service, deactivate --------------
+
+    def _json(self, method, path, body, headers=None):
+        return getattr(self.client, method)(
+            f'/api/v1{path}', data=json.dumps(body),
+            content_type='application/json', headers=headers or {})
+
+    @patch('requests.post')
+    def test_signup_sends_a_link(self, post):
+        res = self._json('post', '/auth/signup',
+                         {'email': 'brand_new@local.com'})
+
+        self.assertEqual(res.status_code, 202)
+        self.assertTrue(post.called)
+
+    @patch('requests.post')
+    def test_signup_is_silent_about_existing_accounts(self, post):
+        known = self._json('post', '/auth/signup',
+                           {'email': 'auth_user@local.com'})
+        _rate_limit_store.clear()
+        unknown = self._json('post', '/auth/signup',
+                             {'email': 'nobody@local.com'})
+
+        # Same status and body either way, or the reply becomes a way to
+        # ask whether an address has an account.
+        self.assertEqual(known.status_code, unknown.status_code)
+        self.assertEqual(known.json, unknown.json)
+
+    @patch('requests.post')
+    def test_password_reset_request_is_silent_about_unknown_email(self, post):
+        res = self._json('post', '/auth/password-reset',
+                         {'email': 'nobody@local.com'})
+
+        self.assertEqual(res.status_code, 202)
+        self.assertFalse(post.called)
+
+    @patch('requests.post')
+    def test_password_reset_request_sends_to_a_known_address(self, post):
+        # Exercises the path that actually builds and sends the link, which
+        # an unknown-address test never reaches.
+        res = self._json('post', '/auth/password-reset',
+                         {'email': 'auth_user@local.com'})
+
+        self.assertEqual(res.status_code, 202)
+        self.assertTrue(post.called)
+
+    @patch('requests.post')
+    def test_reset_link_points_at_these_pages_without_a_console(self, post):
+        from run import app
+
+        with patch.dict(app.config, {'CONSOLE_URL': ''}):
+            self._json('post', '/auth/password-reset',
+                       {'email': 'auth_user@local.com'})
+
+        body = str(post.call_args)
+        self.assertIn('/account/reset/', body)
+
+    @patch('requests.post')
+    def test_reset_link_points_at_the_console_when_one_is_configured(
+            self, post):
+        from run import app
+
+        with patch.dict(app.config,
+                        {'CONSOLE_URL': 'https://console.example.org/'}):
+            self._json('post', '/auth/password-reset',
+                       {'email': 'auth_user@local.com'})
+
+        body = str(post.call_args)
+        # One slash, and the three values the console posts back.
+        self.assertIn('https://console.example.org/reset?uid=', body)
+        self.assertIn('expires=', body)
+        self.assertIn('mac=', body)
+
+    @patch('requests.post')
+    def test_password_reset_completes_with_a_valid_link(self, post):
+        from mod_auth.controllers import generate_hmac_hash
+        from run import app
+
+        expires = int(time.time()) + 600
+        content = f'{self.user_id}|{expires}|{self.user.password}'
+        mac = generate_hmac_hash(app.config.get('HMAC_KEY', ''), content)
+
+        res = self._json('post', '/auth/password-reset/complete', {
+            'user_id': self.user_id,
+            'expires': expires,
+            'mac': mac,
+            'password': 'a-brand-new-password',
+        })
+
+        self.assertEqual(res.status_code, 200)
+        changed = User.query.filter_by(id=self.user_id).first()
+        self.assertTrue(changed.is_password_valid('a-brand-new-password'))
+
+    def test_password_reset_rejects_a_forged_mac(self):
+        res = self._json('post', '/auth/password-reset/complete', {
+            'user_id': self.user_id,
+            'expires': int(time.time()) + 600,
+            'mac': 'not-the-real-signature',
+            'password': 'a-brand-new-password',
+        })
+
+        self.assertEqual(res.status_code, 400)
+        unchanged = User.query.filter_by(id=self.user_id).first()
+        self.assertTrue(unchanged.is_password_valid('userpass123'))
+
+    def test_password_reset_rejects_an_expired_link(self):
+        from mod_auth.controllers import generate_hmac_hash
+        from run import app
+
+        expires = int(time.time()) - 1
+        content = f'{self.user_id}|{expires}|{self.user.password}'
+        mac = generate_hmac_hash(app.config.get('HMAC_KEY', ''), content)
+
+        res = self._json('post', '/auth/password-reset/complete', {
+            'user_id': self.user_id,
+            'expires': expires,
+            'mac': mac,
+            'password': 'a-brand-new-password',
+        })
+
+        self.assertEqual(res.status_code, 400)
+
+    def _auth(self, email='auth_user@local.com', pwd='userpass123',
+              name='acct', scopes=None):
+        # get_token returns the response in this class, not the token.
+        token = self.get_token(email, pwd, name, scopes=scopes).json['token']
+        return {'Authorization': f'Bearer {token}'}
+
+    def test_update_own_name(self):
+        res = self._json('patch', '/auth/me', {'name': 'Renamed'},
+                         self._auth(name='acct1'))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json['name'], 'Renamed')
+
+    def test_changing_password_requires_the_current_one(self):
+        res = self._json('patch', '/auth/me',
+                         {'new_password': 'something-else-entirely'},
+                         self._auth(name='acct2'))
+
+        self.assertEqual(res.status_code, 403)
+
+    def test_change_password_with_the_current_one(self):
+        res = self._json('patch', '/auth/me', {
+            'current_password': 'userpass123',
+            'new_password': 'something-else-entirely',
+        }, self._auth(name='acct3'))
+
+        self.assertEqual(res.status_code, 200)
+        changed = User.query.filter_by(id=self.user_id).first()
+        self.assertTrue(changed.is_password_valid('something-else-entirely'))
+
+    def test_change_email_to_one_already_taken(self):
+        res = self._json('patch', '/auth/me', {
+            'current_password': 'userpass123',
+            'email': 'auth_admin@local.com',
+        }, self._auth(name='acct4'))
+
+        self.assertEqual(res.status_code, 409)
+
+    def test_deactivate_own_account(self):
+        # A plain contributor can never hold tokens:manage, so closing your
+        # own account has to work without it.
+        res = self.client.post(
+            f'/api/v1/users/{self.user_id}/deactivate',
+            headers=self._auth(name='acct5'))
+
+        self.assertEqual(res.status_code, 200)
+        gone = User.query.filter_by(id=self.user_id).first()
+        self.assertEqual(gone.name, f'Anonymous {self.user_id}')
+
+    def test_deactivate_someone_else_needs_admin(self):
+        res = self.client.post(
+            f'/api/v1/users/{self.user_id}/deactivate',
+            headers=self._auth('auth_admin@local.com', 'adminpass123',
+                               'acct6'))
+
+        self.assertEqual(res.status_code, 200)
+        gone = User.query.filter_by(id=self.user_id).first()
+        self.assertEqual(gone.name, f'Anonymous {self.user_id}')
+        self.assertFalse(gone.is_password_valid('userpass123'))
+
+    def test_deactivate_requires_admin_or_ownership(self):
+        res = self.client.post(
+            f'/api/v1/users/{self.admin.id}/deactivate',
+            headers=self._auth(name='acct7'))
+
+        self.assertEqual(res.status_code, 403)
+
+    def test_deactivation_revokes_the_accounts_tokens(self):
+        # A token the account already holds, minted before anyone reaches
+        # for deactivation.
+        victim = self._auth(name='doomed')
+
+        res = self.client.post(
+            f'/api/v1/users/{self.user_id}/deactivate',
+            headers=self._auth('auth_admin@local.com', 'adminpass123',
+                               'deact_admin'))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertGreaterEqual(res.json['tokens_revoked'], 1)
+        self.assertTrue(all(
+            t.is_revoked for t in
+            ApiToken.query.filter(ApiToken.user_id == self.user_id).all()))
+        # And the token stops working straight away, not at its expiry.
+        after = self.client.get('/api/v1/auth/me', headers=victim)
+        self.assertEqual(after.status_code, 401)
+
+    def test_deactivating_someone_else_leaves_the_admin_working(self):
+        admin_headers = self._auth('auth_admin@local.com', 'adminpass123',
+                                   'deact_admin2')
+
+        self.client.post(f'/api/v1/users/{self.user_id}/deactivate',
+                         headers=admin_headers)
+
+        still_fine = self.client.get('/api/v1/auth/me', headers=admin_headers)
+        self.assertEqual(still_fine.status_code, 200)
+
+    def test_ftp_credentials_need_a_write_scope(self):
+        # A working credential for the ingest server is not something a
+        # read-only token should be able to fetch.
+        res = self.client.get(
+            '/api/v1/auth/me/ftp-credentials',
+            headers=self._auth(name='ftp_ro', scopes=['results:read']))
+
+        self.assertEqual(res.status_code, 403)
+
+    def test_get_single_user(self):
+        res = self.client.get(
+            f'/api/v1/users/{self.user_id}',
+            headers=self._auth('auth_admin@local.com', 'adminpass123',
+                               'one_user', scopes=['tokens:manage']))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json['user_id'], self.user_id)
+
+    @patch('requests.post')
+    def test_admin_can_send_someone_a_reset_link(self, post):
+        res = self.client.post(
+            f'/api/v1/users/{self.user_id}/password-reset',
+            headers=self._auth('auth_admin@local.com', 'adminpass123',
+                               'reset_other'))
+
+        self.assertEqual(res.status_code, 202)
+        self.assertTrue(post.called)
+
+    @patch('requests.post')
+    def test_reset_link_for_someone_else_needs_admin(self, post):
+        res = self.client.post(
+            f'/api/v1/users/{self.admin.id}/password-reset',
+            headers=self._auth(name='reset_forbidden'))
+
+        self.assertEqual(res.status_code, 403)
+        self.assertFalse(post.called)
+
+    def test_ftp_credentials_are_created_on_first_ask(self):
+        # Asked for with the scope an uploader would hold; the default set
+        # is read-only and is refused, which the test below covers.
+        res = self.client.get(
+            '/api/v1/auth/me/ftp-credentials',
+            headers=self._auth(name='ftp1', scopes=['runs:write']))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json['username'])
+        self.assertTrue(res.json['password'])
+
+        # Asking twice returns the same pair rather than rotating them.
+        again = self.client.get(
+            '/api/v1/auth/me/ftp-credentials',
+            headers=self._auth(name='ftp2', scopes=['runs:write']))
+        self.assertEqual(again.json['username'], res.json['username'])
+
+    def test_github_link_reports_status_without_the_token(self):
+        user = User.query.filter(User.id == self.user_id).first()
+        user.github_token = 'gho_secret_value'
+        user.github_login = 'someone'
+        g.db.commit()
+
+        res = self.client.get(
+            '/api/v1/auth/me/github', headers=self._auth(name='gh1'))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json['linked'])
+        self.assertEqual(res.json['github_login'], 'someone')
+        # The stored token must never travel back out, under any key.
+        self.assertNotIn('gho_secret_value', res.get_data(as_text=True))
+        # The URL to start a connection carries nothing secret either.
+        self.assertIn('github.com/login/oauth/authorize',
+                      res.json['authorize_url'])
+        self.assertNotIn('client_secret', res.json['authorize_url'])
+
+    def test_github_unlink_forgets_the_connection(self):
+        user = User.query.filter(User.id == self.user_id).first()
+        user.github_token = 'gho_secret_value'
+        user.github_login = 'someone'
+        g.db.commit()
+
+        res = self.client.delete(
+            '/api/v1/auth/me/github', headers=self._auth(name='gh2'))
+
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.json['linked'])
+
+        user = User.query.filter(User.id == self.user_id).first()
+        self.assertIsNone(user.github_token)
+        self.assertIsNone(user.github_login)
+
+    def test_github_endpoints_need_a_token(self):
+        self.assertEqual(self.client.get('/api/v1/auth/me/github').status_code,
+                         401)
+        self.assertEqual(
+            self.client.delete('/api/v1/auth/me/github').status_code, 401)

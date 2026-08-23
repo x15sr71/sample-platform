@@ -4,16 +4,18 @@ import base64
 import datetime
 import fnmatch
 import hashlib
+import itertools
 import json
 import os
 import re
 import shutil
+import tempfile
 import time
 import zipfile
 from collections import defaultdict
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import googleapiclient.discovery
 import requests
@@ -34,10 +36,11 @@ from database import DeclEnum, create_session
 from decorators import get_menu_entries, template_renderer
 from mod_auth.controllers import check_access_rights, login_required
 from mod_auth.models import Role
+from mod_ci import comparison
 from mod_ci.forms import AddUsersToBlacklist, DeleteUserForm
 from mod_ci.models import (BlockedUsers, CategoryTestInfo, GcpInstance,
                            MaintenanceMode, PendingDeletion, PrCommentInfo,
-                           Status)
+                           ReferenceComparison, Status)
 from mod_customized.models import CustomizedTest
 from mod_home.models import CCExtractorVersion, GeneralData
 from mod_regression.models import (Category, RegressionTest,
@@ -52,6 +55,10 @@ from utility import is_valid_signature, request_from_github
 GITHUB_API_TIMEOUT = 30  # Timeout for GitHub API calls
 GCP_API_TIMEOUT = 60  # Timeout for GCP API calls
 ARTIFACT_DOWNLOAD_TIMEOUT = 300  # 5 minutes for artifact downloads
+
+#: How far back to walk a branch's history looking for a run to compare against.
+#: Deep enough to clear a stale branch, short enough to stay one API page.
+ANCESTOR_SEARCH_DEPTH = 50
 GCP_OPERATION_MAX_WAIT = 1800  # 30 minutes max wait for GCP operations
 GCP_VM_CREATE_VERIFY_TIMEOUT = 60  # 60 seconds to verify VM creation started
 
@@ -126,12 +133,20 @@ def safe_db_commit(db, operation_description: str = "database operation") -> boo
         return False
 
 
-# User-friendly messages for known GCP error codes
+_ZONE_EXHAUSTED_MESSAGE = (
+    "GCP resources temporarily unavailable in the configured zone. "
+    "The test will be retried automatically when resources become available."
+)
+
+# User-friendly messages for known GCP error codes.
+#
+# GCP reports zone exhaustion under two codes: the bare ZONE_RESOURCE_POOL_EXHAUSTED and
+# ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS, which carries the specific resource that ran
+# out. Both mean the same thing to us, and in practice the _WITH_DETAILS variant is the one
+# Compute Engine returns for instance inserts.
 GCP_ERROR_MESSAGES = {
-    'ZONE_RESOURCE_POOL_EXHAUSTED': (
-        "GCP resources temporarily unavailable in the configured zone. "
-        "The test will be retried automatically when resources become available."
-    ),
+    'ZONE_RESOURCE_POOL_EXHAUSTED': _ZONE_EXHAUSTED_MESSAGE,
+    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS': _ZONE_EXHAUSTED_MESSAGE,
     'QUOTA_EXCEEDED': (
         "GCP quota limit reached. "
         "The test will be retried automatically when resources become available."
@@ -145,6 +160,7 @@ GCP_ERROR_MESSAGES = {
 # Tests encountering these errors will remain pending and be picked up on the next cron run.
 GCP_RETRYABLE_ERRORS = {
     'ZONE_RESOURCE_POOL_EXHAUSTED',
+    'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
     'QUOTA_EXCEEDED',
 }
 
@@ -991,12 +1007,6 @@ def start_test(compute, app, db, repository: Repository.Repository, test, bot_to
     Path(base_folder).mkdir(parents=True, exist_ok=True)
 
     categories = Category.query.order_by(Category.id.desc()).all()
-    commit_name = 'fetch_commit_' + test.platform.value
-    commit_hash = GeneralData.query.filter(GeneralData.key == commit_name).first().value
-    last_commit = Test.query.filter(and_(Test.commit == commit_hash, Test.platform == test.platform)).first()
-
-    if last_commit is not None:
-        log.debug(f"[{gcp_instance_name}] We will compare against the results of test {last_commit.id}")
 
     regression_ids = test.get_customized_regressiontests()
 
@@ -1029,25 +1039,18 @@ def start_test(compute, app, db, repository: Repository.Repository, test, bot_to
             output_node = etree.SubElement(entry, 'output')
             output_node.text = regression_test.output_type.value
             compare = etree.SubElement(entry, 'compare')
-            last_files = TestResultFile.query.filter(and_(
-                TestResultFile.test_id == last_commit.id,
-                TestResultFile.regression_test_id == regression_test.id
-            )).subquery()
 
             for output_file in regression_test.output_files:
                 ignore_file = str(output_file.ignore).lower()
                 file_node = etree.SubElement(compare, 'file', ignore=ignore_file, id=str(output_file.id))
-                last_commit_files = db.query(last_files.c.got).filter(and_(
-                    last_files.c.regression_test_output_id == output_file.id,
-                    last_files.c.got.isnot(None)
-                )).first()
                 correct = etree.SubElement(file_node, 'correct')
                 # Need a path that is relative to the folder we provide inside the CI environment.
-                if last_commit_files is None:
-                    log.debug(f"Selecting original file for RT #{regression_test.id} ({category.name})")
-                    correct.text = output_file.filename_correct
-                else:
-                    correct.text = output_file.create_correct_filename(last_commit_files[0])
+                # Always the approved baseline. This used to fall back to the previous run's own
+                # output whenever that run had recorded a mismatch, which made the reference roll
+                # forward on its own: a behavioural change was flagged once and then silently
+                # adopted, and because a passing run records no output, the run after that fell
+                # back here again and the same test failed anew. See issue #1173.
+                correct.text = output_file.filename_correct
 
                 expected = etree.SubElement(file_node, 'expected')
                 expected.text = output_file.filename_expected(regression_test.sample.sha)
@@ -2346,6 +2349,11 @@ def progress_reporter(test_id, token):
                 if not upload_type_request(log, test_id, repo_folder, test, request):
                     return "EMPTY"
 
+            elif request.form['type'] == 'artifactupload':
+                log.info(f'[PROGRESS_REPORTER][Test: {test_id}] Artifact upload')
+                if not upload_artifact_type_request(log, test_id, repo_folder, test, request):
+                    return "EMPTY"
+
             elif request.form['type'] == 'finish':
                 log.info(f'[PROGRESS_REPORTER][Test: {test_id}] Test finished')
                 finish_type_request(log, test_id, test, request)
@@ -2650,20 +2658,36 @@ def upload_type_request(log, test_id, repo_folder, test, request) -> bool:
             return False
         temp_dir = os.path.join(repo_folder, 'TempFiles')
         os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, filename)
-        # Save to temporary location
-        uploaded_file.save(temp_path)
-        # Get hash and check if it's already been submitted
-        hash_sha256 = hashlib.sha256()
-        with open(temp_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_sha256.update(chunk)
-        file_hash = hash_sha256.hexdigest()
         filename, file_extension = os.path.splitext(filename)
-        results_dir = os.path.join(repo_folder, 'TestResults')
-        os.makedirs(results_dir, exist_ok=True)
-        final_path = os.path.join(results_dir, f'{file_hash}{file_extension}')
-        os.rename(temp_path, final_path)
+        # The uploaded name is derived from the regression test output, so it is identical
+        # for every test running that same regression test. Sharing one path across
+        # concurrent tests races: the second upload overwrites the first, the first rename
+        # moves the file away, and the second rename then fails with FileNotFoundError ->
+        # HTTP 500 -> no TestResultFile row -> the run is displayed as "No output generated
+        # but there should be". Worse, an upload that lands between another test's save and
+        # its hashing makes that test record the wrong hash, silently flipping its verdict.
+        # A unique temp file per upload removes both.
+        temp_fd, temp_path = tempfile.mkstemp(dir=temp_dir, suffix=file_extension)
+        os.close(temp_fd)
+        try:
+            # Save to temporary location
+            uploaded_file.save(temp_path)
+            # Get hash and check if it's already been submitted
+            hash_sha256 = hashlib.sha256()
+            with open(temp_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_sha256.update(chunk)
+            file_hash = hash_sha256.hexdigest()
+            results_dir = os.path.join(repo_folder, 'TestResults')
+            os.makedirs(results_dir, exist_ok=True)
+            final_path = os.path.join(results_dir, f'{file_hash}{file_extension}')
+            # os.replace is atomic and, unlike leaving a stale temp file behind, keeps
+            # TempFiles clean when two uploads hash to the same content.
+            os.replace(temp_path, final_path)
+        finally:
+            # No-op once the replace succeeded; on any failure it stops the temp file leaking.
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         rto = RegressionTestOutput.query.filter(
             RegressionTestOutput.id == request.form['test_file_id']).first()
         result_file = TestResultFile(test.id, request.form['test_id'], rto.id, rto.correct, file_hash)
@@ -2673,6 +2697,78 @@ def upload_type_request(log, test_id, repo_folder, test, request) -> bool:
         return True
 
     return False
+
+
+# Artifact types the CI VM may upload, mapped to the fixed filenames the REST
+# API expects under <SAMPLE_REPOSITORY>/test_artifacts/<run_id>/ (see the
+# system route _get_gcs_artifacts in mod_api).
+ARTIFACT_TYPES = frozenset({'binary', 'coredump', 'combined_stdout'})
+
+
+def _artifact_target_name(artifact_type: str, platform) -> Optional[str]:
+    """Map an artifact type + platform to the exact filename the API resolves."""
+    if artifact_type == 'binary':
+        return 'ccextractor' if platform == TestPlatform.linux else 'ccextractorwinfull.exe'
+    if artifact_type == 'coredump':
+        return 'coredump'
+    if artifact_type == 'combined_stdout':
+        return 'combined_stdout.log'
+    return None
+
+
+def upload_artifact_type_request(log, test_id, repo_folder, test, request) -> bool:
+    """
+    Handle the artifactupload request type for the progress reporter.
+
+    Stores a CI artifact (binary, coredump, or combined stdout log) under
+    ``<SAMPLE_REPOSITORY>/test_artifacts/<test_id>/`` with the fixed name the
+    REST API expects. The target name is derived server-side from
+    ``artifact_type`` and the test platform, never from the uploaded filename,
+    so a crafted filename cannot escape the artifact directory.
+
+    :param log: logger
+    :type log: Logger
+    :param test_id: the id of the test the artifact belongs to
+    :type test_id: int
+    :param repo_folder: SAMPLE_REPOSITORY path
+    :type repo_folder: str
+    :param test: the concerned test
+    :type test: Test
+    :param request: request parameters
+    :type request: Request
+    :return: True on success, False on validation failure
+    :rtype: bool
+    """
+    artifact_type = request.form.get('artifact_type', '')
+    if artifact_type not in ARTIFACT_TYPES:
+        log.warning(f'[Test: {test_id}] Rejected artifact upload: bad artifact_type {artifact_type!r}')
+        return False
+
+    if 'file' not in request.files:
+        log.warning(f'[Test: {test_id}] Artifact upload missing file')
+        return False
+
+    uploaded_file = request.files['file']
+    if secure_filename(uploaded_file.filename or '') == '':
+        log.warning(f'[Test: {test_id}] Artifact upload has empty filename')
+        return False
+
+    target_name = _artifact_target_name(artifact_type, test.platform)
+    if target_name is None:
+        return False
+
+    artifact_dir = os.path.join(repo_folder, 'test_artifacts', str(test.id))
+    temp_dir = os.path.join(repo_folder, 'TempFiles')
+    os.makedirs(artifact_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    temp_path = os.path.join(temp_dir, f'artifact_{test.id}_{target_name}')
+    uploaded_file.save(temp_path)
+    final_path = os.path.join(artifact_dir, target_name)
+    os.replace(temp_path, final_path)
+
+    log.info(f'[Test: {test_id}] Stored {artifact_type} artifact at {final_path}')
+    return True
 
 
 def finish_type_request(log, test_id, test, request):
@@ -2745,43 +2841,141 @@ def set_avg_time(platform, process_type: str, time_taken: int) -> None:
     safe_db_commit(g.db, f"updating average {process_type} time for {platform.value}")
 
 
-def get_info_for_pr_comment(test: Test) -> PrCommentInfo:
+def find_ancestor_run(repository, test: Test) -> Optional[Test]:
+    """
+    Find the newest completed run for a commit this one descends from.
+
+    The tip of master is not always what a branch was cut from, so a comparison
+    against it charges the branch for whatever master did in between. Walking
+    back from the branch's own base answers the narrower question a reviewer is
+    asking: what changed *here*.
+
+    Any GitHub failure resolves to None rather than raising -- a comment missing
+    one of its comparisons is worth more than no comment at all.
+
+    :param repository: GitHub repository handle used to walk the commit history.
+    :type repository: Repository.Repository
+    :param test: The run whose ancestry should be searched.
+    :type test: Test
+    :return: The closest ancestor's completed run on the same platform, if any.
+    :rtype: Optional[Test]
+    """
+    from run import log
+
+    if repository is None:
+        return None
+    try:
+        if test.pr_nr:
+            start = repository.get_pull(number=test.pr_nr).base.sha
+        else:
+            parents = repository.get_commit(test.commit).parents
+            if not parents:
+                return None
+            start = parents[0].sha
+        ancestry = [commit.sha for commit in
+                    itertools.islice(repository.get_commits(sha=start), ANCESTOR_SEARCH_DEPTH)]
+    except Exception as error:
+        log.warning(f"Could not resolve ancestry for test {test.id}: {type(error).__name__}: {error}")
+        return None
+
+    if not ancestry:
+        return None
+
+    runs = g.db.query(Test).filter(and_(Test.commit.in_(ancestry),
+                                        Test.platform == test.platform,
+                                        Test.id != test.id)).join(
+        TestProgress, Test.id == TestProgress.test_id).filter(
+            TestProgress.status == TestStatus.completed).order_by(TestProgress.id.desc()).all()
+
+    newest_per_commit: Dict[str, Test] = {}
+    for run in runs:
+        newest_per_commit.setdefault(run.commit, run)
+    # Nearest ancestor first: ancestry is already in walk order.
+    for sha in ancestry:
+        if sha in newest_per_commit:
+            return newest_per_commit[sha]
+    return None
+
+
+def _compare_against(label: str, reference: Optional[Test], current: Dict[int, comparison.TestState],
+                     regression_tests: Dict[int, RegressionTest],
+                     already_used: Dict[Any, str]) -> ReferenceComparison:
+    """
+    Describe this run's results against one reference run.
+
+    :param label: How the reference should be named to a reader.
+    :type label: str
+    :param reference: The run to compare against, or None when there is none.
+    :type reference: Optional[Test]
+    :param current: States for the run being reported on.
+    :type current: Dict[int, comparison.TestState]
+    :param regression_tests: Regression tests by id, for rendering the buckets.
+    :type regression_tests: Dict[int, RegressionTest]
+    :param already_used: Run ids already compared against, mapped to their label.
+    :type already_used: Dict[Any, str]
+    :return: The comparison, empty when there was nothing to compare against.
+    :rtype: ReferenceComparison
+    """
+    if reference is None:
+        empty: Dict[str, List[RegressionTest]] = {verdict: [] for verdict in comparison.VERDICTS}
+        return ReferenceComparison(label, None, empty, {verdict: 0 for verdict in comparison.VERDICTS})
+
+    duplicate_of = already_used.get(reference.id)
+    if duplicate_of is None:
+        already_used[reference.id] = label
+
+    buckets = comparison.compare(current, comparison.build_state(get_test_results(reference)))
+    tests = {verdict: [regression_tests[rt_id] for rt_id in ids if rt_id in regression_tests]
+             for verdict, ids in buckets.items()}
+    return ReferenceComparison(label, reference, tests, comparison.summarise(buckets), duplicate_of)
+
+
+def get_info_for_pr_comment(test: Test, repository=None) -> PrCommentInfo:
     """
     Return info about the given test for use in a PR comment.
 
+    Pass and fail are decided against the approved output and nothing else. The
+    comparisons that follow do not change any verdict; they say what each
+    failure means relative to master and to the commit the branch was cut from,
+    which is what separates "this change broke it" from "it has been failing for
+    a month".
+
     :param test: The test whose report will be returned
     :type test: Test
+    :param repository: GitHub repository handle, needed to resolve the ancestor.
+    :type repository: Optional[Repository.Repository]
     """
+    test_results = get_test_results(test)
+    current = comparison.build_state(test_results)
+
+    category_stats = []
+    failed_tests = []
+    regression_tests: Dict[int, RegressionTest] = {}
+    for category_results in test_results:
+        passed_in_category = 0
+        for entry in category_results['tests']:
+            regression_tests[entry['test'].id] = entry['test']
+            if entry['error']:
+                failed_tests.append(entry['test'])
+            else:
+                passed_in_category += 1
+        category_stats.append(CategoryTestInfo(category_results['category'].name,
+                                               len(category_results['tests']), passed_in_category))
+
     last_test_master = g.db.query(Test).filter(Test.branch == "master", Test.test_type == TestType.commit,
                                                Test.platform == test.platform).join(
         TestProgress, Test.id == TestProgress.test_id).filter(
             TestProgress.status == TestStatus.completed).order_by(TestProgress.id.desc()).first()
 
-    extra_failed_tests = []
-    common_failed_tests = []
-    fixed_tests = []
-    category_stats = []
+    already_used: Dict[Any, str] = {}
+    comparisons = [
+        _compare_against('the tip of master', last_test_master, current, regression_tests, already_used),
+        _compare_against('the commit this branch was cut from', find_ancestor_run(repository, test),
+                         current, regression_tests, already_used),
+    ]
 
-    test_results = get_test_results(test)
-    platform_column = f"last_passed_on_{test.platform.value}"
-    for category_results in test_results:
-        category_name = category_results['category'].name
-
-        category_test_pass_count = 0
-        for test in category_results['tests']:
-            if not test['error']:
-                category_test_pass_count += 1
-                if last_test_master and getattr(test['test'], platform_column) != last_test_master.id:
-                    fixed_tests.append(test['test'])
-            else:
-                if last_test_master and getattr(test['test'], platform_column) != last_test_master.id:
-                    common_failed_tests.append(test['test'])
-                else:
-                    extra_failed_tests.append(test['test'])
-
-        category_stats.append(CategoryTestInfo(category_name, len(category_results['tests']), category_test_pass_count))
-
-    return PrCommentInfo(category_stats, extra_failed_tests, fixed_tests, common_failed_tests, last_test_master)
+    return PrCommentInfo(category_stats, failed_tests, len(current) - len(failed_tests),
+                         len(current), comparisons, last_test_master)
 
 
 def comment_pr(test: Test) -> str:
@@ -2795,16 +2989,28 @@ def comment_pr(test: Test) -> str:
 
     test_id = test.id
     platform = test.platform.name
-    comment_info = get_info_for_pr_comment(test)
-    template = app.jinja_env.get_or_select_template('ci/pr_comment.txt')
-    message = template.render(comment_info=comment_info, test_id=test_id, platform=platform)
-    log.debug(f"GitHub PR Comment Message Created for Test_id: {test_id}")
     if not g.github['bot_token']:
         log.error(f"GitHub token not configured, cannot post PR comment for Test_id: {test_id}")
         return Status.FAILURE
+
+    # Resolved before the report is built, because working out which commit this
+    # branch was cut from needs the repository. A failure here costs that one
+    # comparison; the comment is still worth posting without it.
+    gh = None
+    repository = None
     try:
         gh = Github(auth=Auth.Token(g.github['bot_token']))
         repository = gh.get_repo(f"{g.github['repository_owner']}/{g.github['repository']}")
+    except Exception as e:
+        log.error(f"Could not reach GitHub for Test_id: {test_id} with Exception {e}")
+
+    comment_info = get_info_for_pr_comment(test, repository)
+    template = app.jinja_env.get_or_select_template('ci/pr_comment.txt')
+    message = template.render(comment_info=comment_info, test_id=test_id, platform=platform)
+    log.debug(f"GitHub PR Comment Message Created for Test_id: {test_id}")
+    try:
+        if repository is None or gh is None:
+            raise RuntimeError('no GitHub repository handle')
         # Pull requests are just issues with code, so GitHub considers PR comments in issues
         pull_request = repository.get_pull(number=test.pr_nr)
         comments = pull_request.get_issue_comments()
@@ -2817,7 +3023,11 @@ def comment_pr(test: Test) -> str:
         log.debug(f"GitHub PR Comment ID {comment.id} Uploaded for Test_id: {test_id}")
     except Exception as e:
         log.error(f"GitHub PR Comment Failed for Test_id: {test_id} with Exception {e}")
-    return Status.SUCCESS if len(comment_info.extra_failed_tests) == 0 else Status.FAILURE
+    # The verdict is whether the output matched what was approved, and nothing
+    # else. The comparisons in the comment explain a failure; they never excuse
+    # one, because a baseline that no longer matches reality is a thing to fix
+    # rather than a thing to pass.
+    return Status.SUCCESS if len(comment_info.failed_tests) == 0 else Status.FAILURE
 
 
 @mod_ci.route('/show_maintenance')

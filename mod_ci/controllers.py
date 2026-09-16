@@ -43,7 +43,7 @@ from mod_ci.models import (BlockedUsers, CategoryTestInfo, GcpInstance,
                            ReferenceComparison, Status)
 from mod_customized.models import CustomizedTest
 from mod_home.models import CCExtractorVersion, GeneralData
-from mod_regression.models import (Category, RegressionTest,
+from mod_regression.models import (Category, OutputType, RegressionTest,
                                    RegressionTestOutput)
 from mod_sample.models import Issue
 from mod_test.controllers import get_test_results
@@ -1146,6 +1146,26 @@ def start_test(compute, app, db, repository: Repository.Repository, test, bot_to
             output_node = etree.SubElement(entry, 'output')
             output_node.text = regression_test.output_type.value
             compare = etree.SubElement(entry, 'compare')
+
+            # The runner passes the first compare file as CCExtractor's -o and then
+            # looks for every compare file under that exact name. That only works
+            # while CCExtractor writes -o itself. A 708-only run does not: since
+            # commit 6efa41a7 ("Extract 708 subs by default"), passing --service
+            # without -1/-2/-12 sets extract_only_708, which suppresses the -o file,
+            # and the service data goes to <basename of -o>.p<program>.svc<service>
+            # instead. Handing it a name that already carries the suffix produces
+            # <sha>.p1.svc01.p1.svc01.txt, which nothing looks for.
+            #
+            # So give it the bare sample name to use as the base. It is ignored, so
+            # it is never compared or uploaded, and the service files the other rows
+            # name become findable again. The extension is kept because the base is
+            # derived by trimming everything after the last dot -- a bare name would
+            # let the Windows runner's './TempFiles/...' prefix supply that dot.
+            if regression_test.output_type == OutputType.cea708 and len(regression_test.output_files) > 0:
+                base_name = f"{regression_test.sample.sha}{regression_test.output_files[0].correct_extension}"
+                base_node = etree.SubElement(compare, 'file', ignore='true', id='-1')
+                etree.SubElement(base_node, 'correct').text = base_name
+                etree.SubElement(base_node, 'expected').text = base_name
 
             for output_file in regression_test.output_files:
                 ignore_file = str(output_file.ignore).lower()

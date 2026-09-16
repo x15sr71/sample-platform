@@ -18,7 +18,8 @@ from mod_ci.controllers import (Workflow_builds, get_info_for_pr_comment,
 from mod_ci.models import BlockedUsers
 from mod_customized.models import CustomizedTest
 from mod_home.models import CCExtractorVersion, GeneralData
-from mod_regression.models import (RegressionTest, RegressionTestOutput,
+from mod_regression.models import (OutputType, RegressionTest,
+                                   RegressionTestOutput,
                                    RegressionTestOutputFiles)
 from mod_test.models import (Test, TestPlatform, TestProgress, TestResultFile,
                              TestStatus, TestType)
@@ -369,6 +370,91 @@ class TestControllers(BaseTestCase):
             RegressionTestOutput.id == 2).first().correct_extension
         self.assertNotIn(stored_got, correct_texts,
                          "a previous run's recorded output was used as the comparison target")
+
+    @mock.patch('mod_ci.controllers.wait_for_operation')
+    @mock.patch('mod_ci.controllers.create_instance')
+    @mock.patch('mod_ci.controllers.save_xml_to_file')
+    @mock.patch('builtins.open', new_callable=mock.mock_open())
+    @mock.patch('mod_ci.controllers.g')
+    @mock.patch('mod_ci.controllers.TestProgress')
+    @mock.patch('mod_ci.controllers.GcpInstance')
+    def test_start_test_cea708_entry_leads_with_bare_output_name(self, mock_gcp_instance, mock_test_progress,
+                                                                 mock_g, mock_open_file, mock_save_xml,
+                                                                 mock_create_instance, mock_wait_for_operation):
+        """A CEA-708 entry must lead with the bare sample name for the runner to use as -o.
+
+        The runner passes the first compare file as CCExtractor's ``-o`` and then looks
+        for every compare file under that exact name. A 708-only run writes no ``-o``
+        file at all, only ``<basename of -o>.p<program>.svc<service><ext>``, so leading
+        with a name that already carries the suffix asks for ``sample1.p1.svc01.srt``
+        while CCExtractor writes ``sample1.p1.svc01.p1.svc01.srt``, and the whole
+        category reports no output.
+        """
+        import zipfile
+
+        import requests
+        from github.Artifact import Artifact
+
+        from mod_ci.controllers import Artifact_names, start_test
+
+        mock_gcp_instance.query.filter.return_value.first.return_value = None
+        mock_test_progress.query.filter.return_value.first.return_value = None
+
+        regression_test = RegressionTest.query.filter(RegressionTest.id == 1).first()
+        regression_test.output_type = OutputType.cea708
+        g.db.commit()
+
+        test = Test.query.first()
+        repository = MagicMock()
+
+        artifact = MagicMock(Artifact)
+        artifact.name = Artifact_names.linux if test.platform == TestPlatform.linux else Artifact_names.windows
+        artifact.workflow_run.head_sha = test.commit
+
+        class mock_zip:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extractall(*args, **kwargs):
+                return None
+
+        repository.get_artifacts.return_value = [artifact]
+        response = requests.models.Response()
+        response.status_code = 200
+        requests.get = MagicMock(return_value=response)
+        zipfile.ZipFile = MagicMock(return_value=mock_zip())
+
+        create_mock_db_query(mock_g)
+        mock_create_instance.return_value = {'name': 'op-1', 'status': 'RUNNING'}
+        mock_wait_for_operation.return_value = {'status': 'DONE'}
+
+        start_test(mock.ANY, self.app, mock_g.db, repository, test, mock.ANY)
+
+        entries = []
+        for call in mock_save_xml.call_args_list:
+            entries.extend(call.args[0].findall(f"entry[@id='{regression_test.id}']"))
+
+        self.assertTrue(entries, "the CEA-708 regression test was not written to any XML")
+
+        output_file = regression_test.output_files[0]
+        expected_base = f"{regression_test.sample.sha}{output_file.correct_extension}"
+
+        for entry in entries:
+            files = entry.find('compare').findall('file')
+            self.assertGreater(len(files), 1, "no base name was emitted ahead of the compared files")
+
+            base = files[0]
+            self.assertEqual('true', base.get('ignore'), "the base name must not be compared or uploaded")
+            self.assertEqual(expected_base, base.find('expected').text,
+                             "the runner would pass a name CCExtractor does not write to")
+            self.assertIsNotNone(base.find('correct'), "the runner requires a <correct> node on every file")
+
+            # The files actually being compared are left exactly as they were.
+            compared = [f.find('expected').text for f in files[1:]]
+            self.assertEqual([output_file.filename_expected(regression_test.sample.sha)], compared)
 
     @mock.patch('github.Github.get_repo')
     @mock.patch('mod_ci.controllers.start_test')

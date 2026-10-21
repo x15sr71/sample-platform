@@ -27,8 +27,8 @@ so it takes the same broken path as the CEA-708 category without being part of
 it.
 
 Note RT 140 is deliberately left alone. Its sample carries no CEA-708 data at
-all (``CC type 1: 0``), so no expected filename can make it pass; it needs a
-decision about what that test is for.
+all (``CC type 2: 0``, ``CC type 3: 0``), so no expected filename can make it
+pass; it needs a decision about what that test is for.
 
 Revision ID: f2c71a9b5e04
 Revises: e7c9b4a2d1f0

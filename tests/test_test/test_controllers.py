@@ -1,3 +1,4 @@
+import re
 from unittest import mock
 
 from werkzeug.exceptions import Forbidden, NotFound
@@ -59,6 +60,30 @@ class TestControllers(BaseTestCase):
         regression_tests = RegressionTest.query.all()
         self.assertIn(regression_tests[1].command, str(response.data))
         self.assertNotIn(regression_tests[0].command, str(response.data))
+
+    def test_row_verdict_matches_results_for_nonzero_expected_rc(self):
+        """A test exiting with its expected non-zero code is only shown as Pass if its output matches."""
+        from flask import g
+        self.create_user_with_role(
+            self.user.name, self.user.email, self.user.password, Role.tester)
+        self.create_forktest("own-fork-commit", TestPlatform.linux, regression_tests=[2])
+        g.db.add_all([
+            TestProgress(3, TestStatus.preparation, "Test 3 preparation"),
+            TestProgress(3, TestStatus.testing, "Test 3 testing"),
+            TestProgress(3, TestStatus.completed, "Test 3 completed"),
+            TestResult(3, 2, 200, 10, 10),  # RT 2 expects exit code 10 and gets it
+        ])
+        result_file = TestResultFile(3, 2, 2, 'sample_out2')
+        g.db.add(result_file)
+        g.db.commit()
+        # got: None = matches the expected output, 'bluedabadee' = a registered variant, else a mismatch
+        for got, verdict in ((None, 'Pass'), ('bluedabadee', 'Pass'), ('mismatched_output', 'Fail')):
+            with self.subTest(got=got):
+                result_file.got = got
+                g.db.commit()
+                page = self.app.test_client().get('/test/3').data.decode()
+                cell = re.search(r'/regression/test/2/view.*?<td data-title="Result">(.*?)</td>', page, re.S)
+                self.assertEqual(verdict, re.sub(r'<[^>]+>', '', cell.group(1)).strip())
 
     def test_restart_with_permission(self):
         """Test test restart with permission."""

@@ -153,7 +153,7 @@
                                                             {%- endif %}
                                                         {% elif file.got == "error" %}
                                                             No output generated but there should be
-                                                        {% elif file.got is none or no_error.found or (test.result and test.result.exit_code != 0) -%}
+                                                        {% elif file.got is none or no_error.found -%}
                                                             Pass
                                                         {% else %}
                                                             <a href="#" class="diff_link" data-test="{{ file.test_id }}" data-regression="{{ file.regression_test_id }}" data-output="{{ file.regression_test_output_id }}">Fail</a>

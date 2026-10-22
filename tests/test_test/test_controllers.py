@@ -73,13 +73,13 @@ class TestControllers(BaseTestCase):
             TestProgress(3, TestStatus.completed, "Test 3 completed"),
             TestResult(3, 2, 200, 10, 10),  # RT 2 expects exit code 10 and gets it
         ])
-        result_file = TestResultFile(3, 2, 2, 'sample_out2')
-        g.db.add(result_file)
+        g.db.add(TestResultFile(3, 2, 2, 'sample_out2'))
         g.db.commit()
         # got: None = matches the expected output, 'bluedabadee' = a registered variant, else a mismatch
         for got, verdict in ((None, 'Pass'), ('bluedabadee', 'Pass'), ('mismatched_output', 'Fail')):
             with self.subTest(got=got):
-                result_file.got = got
+                # Update through the current session: each request replaces g.db, so a held object isn't committed
+                g.db.query(TestResultFile).filter(TestResultFile.test_id == 3).update({'got': got})
                 g.db.commit()
                 page = self.app.test_client().get('/test/3').data.decode()
                 cell = re.search(r'/regression/test/2/view.*?<td data-title="Result">(.*?)</td>', page, re.S)
